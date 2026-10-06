@@ -4,8 +4,10 @@ Run from this folder with:
     python kmeans_humanitarian.py --data Country-data.csv --k 4
 
 The script keeps country names out of the feature matrix, standardizes all
-numeric variables, evaluates k=2..10, fits the selected K-Means model, writes
-cluster outputs, and produces figures for the report.
+numeric variables, evaluates k=2..10, fits the selected K-Means model, runs a
+stability check, writes cluster outputs, and produces the report figures.
+This script is the single source of truth: build_assets.py only reads the files
+it writes into results/ and figures/ to assemble the .docx report.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import seaborn as sns
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.metrics import (
+    adjusted_rand_score,
     calinski_harabasz_score,
     davies_bouldin_score,
     silhouette_score,
@@ -163,25 +166,26 @@ def save_figures(
     labels: np.ndarray,
     features: list[str],
     figdir: Path,
+    k: int,
+    rank_map: dict[int, int],
 ) -> None:
+    """Write the four figures used in the report (names match the .docx)."""
     figdir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style="whitegrid", context="notebook")
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), constrained_layout=True)
-    axes[0].plot(eval_df["k"], eval_df["inertia"], marker="o", color="#1f4e79")
-    axes[0].axvline(4, color="#c0504d", linestyle="--", linewidth=1.2, label="k = 4")
-    axes[0].set_title("Elbow method")
-    axes[0].set_xlabel("Number of clusters k")
-    axes[0].set_ylabel("Within-cluster SSE")
-    axes[0].legend(frameon=False)
-    axes[1].plot(eval_df["k"], eval_df["silhouette"], marker="o", color="#2e8b57")
-    axes[1].axvline(4, color="#c0504d", linestyle="--", linewidth=1.2, label="k = 4")
-    axes[1].set_title("Silhouette score")
-    axes[1].set_xlabel("Number of clusters k")
-    axes[1].set_ylabel("Mean silhouette")
-    axes[1].legend(frameon=False)
-    fig.savefig(figdir / "01_k_selection.png", dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    for name, col, title, ylabel, color in [
+        ("01_elbow.png", "inertia", "Phương pháp Elbow", "SSE trong cụm", "#1f4e79"),
+        ("02_silhouette.png", "silhouette", "Điểm Silhouette", "Silhouette trung bình", "#2e8b57"),
+    ]:
+        fig, ax = plt.subplots(figsize=(8.0, 4.6), constrained_layout=True)
+        ax.plot(eval_df["k"], eval_df[col], marker="o", color=color)
+        ax.axvline(k, color="#c0504d", linestyle="--", linewidth=1.2, label=f"k = {k}")
+        ax.set_title(title)
+        ax.set_xlabel("Số cụm k")
+        ax.set_ylabel(ylabel)
+        ax.legend(frameon=False)
+        fig.savefig(figdir / name, dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
     pca = PCA(n_components=2, random_state=0)
     coords = pca.fit_transform(z)
@@ -195,7 +199,7 @@ def save_figures(
             s=42,
             alpha=0.85,
             color=palette[cluster],
-            label=f"Cụm {cluster}",
+            label=f"Ưu tiên {rank_map[cluster]} (mã {cluster})",
             edgecolor="white",
             linewidth=0.4,
         )
@@ -207,10 +211,14 @@ def save_figures(
     ax.set_xlabel("Thành phần chính PC1")
     ax.set_ylabel("Thành phần chính PC2")
     ax.legend(frameon=False, ncol=2)
-    fig.savefig(figdir / "02_pca_clusters.png", dpi=220, bbox_inches="tight")
+    fig.savefig(figdir / "03_pca_clusters.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-    profile_z = pd.DataFrame(z, columns=features).assign(cluster=labels).groupby("cluster").mean()
+    profile_z = (
+        pd.DataFrame(z, columns=features).assign(cluster=labels).groupby("cluster").mean()
+    )
+    profile_z = profile_z.loc[sorted(profile_z.index, key=lambda c: rank_map[c])]
+    profile_z.index = [f"Ưu tiên {rank_map[c]} (mã {c})" for c in profile_z.index]
     fig, ax = plt.subplots(figsize=(11, 3.8), constrained_layout=True)
     sns.heatmap(
         profile_z,
@@ -224,9 +232,42 @@ def save_figures(
     )
     ax.set_title("Hồ sơ trung bình chuẩn hóa theo cụm")
     ax.set_xlabel("Biến đầu vào")
-    ax.set_ylabel("Cụm")
-    fig.savefig(figdir / "03_cluster_profile_heatmap.png", dpi=220, bbox_inches="tight")
+    ax.set_ylabel("")
+    fig.savefig(figdir / "04_profile_heatmap.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+def stability_analysis(
+    z: np.ndarray,
+    labels: np.ndarray,
+    features: list[str],
+    k: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Check how much the k-cluster partition changes under perturbations.
+
+    Uses the adjusted Rand index (ARI, 1 = identical partition) against the
+    baseline labels for (a) different random seeds, (b) dropping one feature
+    at a time, and (c) refitting on random 80% subsamples.
+    """
+    rows = []
+    for s in range(20):
+        alt = KMeans(n_clusters=k, n_init=50, random_state=s).fit_predict(z)
+        rows.append({"test": "seed", "detail": f"seed={s}", "ari": adjusted_rand_score(labels, alt),
+                     "smallest_cluster": int(np.bincount(alt).min())})
+    for j, name in enumerate(features):
+        zz = np.delete(z, j, axis=1)  # z is already standardized per column
+        alt = KMeans(n_clusters=k, n_init=50, random_state=seed).fit_predict(zz)
+        rows.append({"test": "drop_feature", "detail": name, "ari": adjusted_rand_score(labels, alt),
+                     "smallest_cluster": int(np.bincount(alt).min())})
+    rng = np.random.default_rng(seed)
+    n = len(z)
+    for b in range(100):
+        idx = rng.choice(n, size=int(0.8 * n), replace=False)
+        alt = KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(z[idx])
+        rows.append({"test": "subsample_80", "detail": f"rep={b}", "ari": adjusted_rand_score(labels[idx], alt),
+                     "smallest_cluster": int(np.bincount(alt).min())})
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
@@ -267,7 +308,13 @@ def main() -> None:
     pd.DataFrame(coords, columns=["PC1", "PC2"]).assign(
         country=df["country"].values, cluster=labels
     ).to_csv(args.outdir / "pca_coordinates.csv", index=False)
-    save_figures(eval_df, z, labels, FEATURES, args.figdir)
+    rank_map = (
+        country_scores.drop_duplicates("cluster").set_index("cluster")["cluster_priority_rank"].to_dict()
+    )
+    save_figures(eval_df, z, labels, FEATURES, args.figdir, args.k, rank_map)
+
+    stab = stability_analysis(z, labels, FEATURES, args.k, args.seed)
+    stab.to_csv(args.outdir / "stability.csv", index=False)
 
     summary = {
         "n_countries": int(len(df)),
@@ -282,6 +329,12 @@ def main() -> None:
         "pca_variance_ratio": pca.explained_variance_ratio_.tolist(),
         "cluster_sizes": {
             str(k): int(v) for k, v in pd.Series(labels).value_counts().sort_index().items()
+        },
+        "stability_ari_mean": {
+            t: float(g["ari"].mean()) for t, g in stab.groupby("test")
+        },
+        "stability_ari_min": {
+            t: float(g["ari"].min()) for t, g in stab.groupby("test")
         },
     }
     (args.outdir / "run_summary.json").write_text(
