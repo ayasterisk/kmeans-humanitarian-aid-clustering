@@ -6,8 +6,6 @@ Run from this folder with:
 The script keeps country names out of the feature matrix, standardizes all
 numeric variables, evaluates k=2..10, fits the selected K-Means model, runs a
 stability check, writes cluster outputs, and produces the report figures.
-This script is the single source of truth: build_assets.py only reads the files
-it writes into results/ and figures/ to assemble the .docx report.
 """
 
 from __future__ import annotations
